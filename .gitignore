@@ -1,0 +1,16 @@
+# Bag data — never committed
+data/
+outputs/
+*.mcap
+*.db3
+*.rrd
+
+# Python
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+.venv/
+
+# Editor / OS
+.vscode/
+.DS_Store
