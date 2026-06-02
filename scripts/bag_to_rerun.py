@@ -27,6 +27,7 @@ from rosbags.highlevel import AnyReader
 
 try:
     import msgpack
+    import msgpack_numpy  # /G1Env arrays are msgpack-numpy encoded
     HAS_MSGPACK = True
 except ImportError:
     HAS_MSGPACK = False
@@ -50,7 +51,8 @@ def try_decode_dict(raw_bytes):
     """Decode a std_msgs/String payload as msgpack or JSON. Returns dict or None."""
     if HAS_MSGPACK:
         try:
-            return msgpack.unpackb(raw_bytes, raw=False)
+            return msgpack.unpackb(raw_bytes, raw=False,
+                                   object_hook=msgpack_numpy.decode)
         except Exception:
             pass
     try:
@@ -152,6 +154,21 @@ def main():
     parser.add_argument("--subsample", type=int, default=20,
                         help="Log every Nth scalar message (default 20: 1 kHz -> 50 Hz)")
     parser.add_argument("--no-images", action="store_true", help="Skip image decoding")
+    parser.add_argument("--urdf", type=str, default=None,
+                        help="Path to G1 URDF (default: vendored asset / $G1_URDF / GR00T checkout)")
+    parser.add_argument("--no-robot", action="store_true",
+                        help="Skip logging the animated 3D robot model")
+    parser.add_argument("--show-collision", action="store_true",
+                        help="Don't hide the URDF's collision geometries in the viewer")
+    parser.add_argument("--strict", action="store_true",
+                        help="Exit non-zero if the bag is missing expected topics")
+    parser.add_argument("--out", type=str, default=None,
+                        help="Path for the .rrd recording "
+                             "(default: /workspace/outputs/<bag>.rrd in-container, else ./<bag>.rrd)")
+    parser.add_argument("--serve-web", action="store_true",
+                        help="Serve the recording in the Rerun web viewer instead of saving to .rrd")
+    parser.add_argument("--web-port", type=int, default=9876,
+                        help="Port for the Rerun web viewer (with --serve-web)")
     args = parser.parse_args()
 
     if not args.bag.exists():
@@ -162,8 +179,55 @@ def main():
         print("Note: msgpack not installed. Will try JSON-only for PC-internal topics.")
         print("      Install with: pip install msgpack")
 
+    # In --serve-web mode the recording is streamed live to a Rerun web viewer.
+    # Otherwise we save a .rrd file under /workspace/outputs (host-mounted at
+    # ~/baglab/outputs via docker/run.sh) for offline viewing.
     rr.init("g1_bag")
-    rr.save("/tmp/g1_bag.rrd")
+    out_path: Path | None = None
+    if args.serve_web:
+        # rerun >=0.32 splits serving into a data server (gRPC) plus a thin HTML
+        # viewer. With open_browser=False the viewer doesn't auto-pick up the
+        # connect URL, so we embed it as a ?url= query the user opens directly.
+        import urllib.parse
+        grpc_port = args.web_port + 1
+        grpc_url = rr.serve_grpc(grpc_port=grpc_port)
+        rr.serve_web_viewer(web_port=args.web_port, open_browser=False)
+        viewer_url = (f"http://127.0.0.1:{args.web_port}/"
+                      f"?url={urllib.parse.quote(grpc_url, safe='')}")
+        print(f"Rerun web viewer ready. Open this URL in your browser:", flush=True)
+        print(f"  {viewer_url}", flush=True)
+        print(f"(plain http://127.0.0.1:{args.web_port}/ shows the welcome "
+              f"screen — use the URL above to auto-connect.)", flush=True)
+    else:
+        if args.out:
+            out_path = Path(args.out)
+        else:
+            out_dir = (Path("/workspace/outputs") if Path("/workspace/outputs").is_dir()
+                       else Path.cwd())
+            out_path = out_dir / f"{args.bag.stem}.rrd"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        rr.save(str(out_path))
+        print(f"Saving recording to {out_path}")
+
+    # Animated 3D robot model (driven by /lowstate body + /dex3 hand joints).
+    robot_logger = None
+    last_left_hand, last_right_hand = None, None
+    if not args.no_robot:
+        try:
+            from g1_urdf_logger import G1UrdfLogger, find_g1_urdf
+            urdf = find_g1_urdf(args.urdf)
+            if urdf is None:
+                print("Note: no G1 URDF found; skipping robot model "
+                      "(pass --urdf or set $G1_URDF).")
+            else:
+                robot_logger = G1UrdfLogger(urdf)
+                robot_logger.log_model()
+                if not args.show_collision:
+                    robot_logger.hide_collision()
+                print(f"Robot model: {urdf} (native rerun URDF)")
+        except Exception as e:
+            print(f"Note: could not load robot model ({e}); continuing without it.")
+            robot_logger = None
 
     counters, logged = {}, {}
     def inc(t, topic):
@@ -173,7 +237,22 @@ def main():
         all_topics = {conn.topic: conn.msgtype for conn in reader.connections}
         print(f"Bag: {args.bag.name}")
         print(f"Duration: {reader.duration / 1e9:.2f}s, Messages: {reader.message_count}")
-        print(f"Streaming to Rerun viewer...")
+
+        # Surface missing expected topics upfront so a partial bag is obvious.
+        from baglab.constants import DEFAULT_EXPECTED_TOPICS
+        missing = sorted(set(DEFAULT_EXPECTED_TOPICS) - set(all_topics))
+        if missing:
+            msg = (f"WARNING: bag is missing {len(missing)} expected topics: "
+                   f"{', '.join(missing)}")
+            print(msg, file=sys.stderr)
+            if args.strict:
+                print("ERROR: --strict was set; aborting.", file=sys.stderr)
+                sys.exit(2)
+
+        if args.serve_web:
+            print(f"Streaming to Rerun web viewer on http://0.0.0.0:{args.web_port}")
+        else:
+            print(f"Logging to {out_path}")
         print()
 
         for conn, timestamp, rawdata in reader.messages():
@@ -196,6 +275,12 @@ def main():
                     if i >= len(msg.motor_state): break
                     rr.log(f"observation/state/q/{name}", rr.Scalars(msg.motor_state[i].q))
                     rr.log(f"observation/state/dq/{name}", rr.Scalars(msg.motor_state[i].dq))
+                if robot_logger is not None:
+                    body_q = [msg.motor_state[i].q
+                              for i in range(min(29, len(msg.motor_state)))]
+                    robot_logger.update(body_q=body_q,
+                                        left_hand_q=last_left_hand,
+                                        right_hand_q=last_right_hand)
                 rr.log("imu/body/accel/x", rr.Scalars(msg.imu_state.accelerometer[0]))
                 rr.log("imu/body/accel/y", rr.Scalars(msg.imu_state.accelerometer[1]))
                 rr.log("imu/body/accel/z", rr.Scalars(msg.imu_state.accelerometer[2]))
@@ -218,6 +303,11 @@ def main():
                 if counters[topic] % args.subsample != 0: continue
                 side = "left" if "left" in topic else "right"
                 msg = reader.deserialize(rawdata, msg_type)
+                hand_q = [motor.q for motor in msg.motor_state]
+                if side == "left":
+                    last_left_hand = hand_q
+                else:
+                    last_right_hand = hand_q
                 for i, motor in enumerate(msg.motor_state):
                     rr.log(f"observation/state/hand_{side}/q/{i}", rr.Scalars(motor.q))
                     rr.log(f"observation/state/hand_{side}/dq/{i}", rr.Scalars(motor.dq))
@@ -301,7 +391,23 @@ def main():
         flag = "" if read_n > 0 else "  [empty]"
         print(f"  {topic:<40} {msgtype[:28]:<28} {read_n:>8} {logged_n:>8}{flag}")
     print()
-    print("Rerun viewer should be open. Close it to exit.")
+    if args.serve_web:
+        print(f"Done streaming bag. Viewer still serving — open:")
+        print(f"  {viewer_url}")
+        print("Ctrl+C to stop.")
+        try:
+            import signal
+            signal.pause()
+        except (KeyboardInterrupt, AttributeError):
+            # signal.pause() doesn't exist on Windows; fall through to plain wait.
+            try:
+                while True:
+                    import time as _t
+                    _t.sleep(3600)
+            except KeyboardInterrupt:
+                pass
+    else:
+        print(f"Done. Open with: rerun {out_path}")
 
 
 if __name__ == "__main__":

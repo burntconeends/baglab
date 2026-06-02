@@ -1,21 +1,23 @@
-"""Flask browser UI for the G1 rosbag workflow.
+"""Flask browser UI for the baglab rosbag workflow.
 
-Run from the repo root or anywhere inside the checkout:
+Exposes every baglab function: sync bags from the Orin, convert .db3 -> .mcap,
+run bronze quality checks (baglab check), save an animated Rerun recording
+(.rrd) for offline viewing, and stream a bag into Rerun's web viewer.
 
-    python3 decoupled_wbc/scripts/rosbag/rosbag_gui.py
+Run inside the container (recommended — all deps are installed there):
 
-Then open http://127.0.0.1:8765.
+    ./docker/run.sh
+    # inside:
+    python3 scripts/rosbag_gui.py --host 0.0.0.0 --port 8765
+    # then open http://127.0.0.1:8765
 
-The Rerun action streams the bag into Rerun's web viewer, so no X11/Wayland
-forwarding is required.
+If the GUI is launched on the host but the deps live inside a running
+container, route jobs through docker exec:
 
-If the GUI is launched on the host but conversion dependencies live inside
-the decoupled_wbc Docker container, run jobs through docker exec:
-
-    python3 decoupled_wbc/scripts/rosbag/rosbag_gui.py \
-        --docker-container decoupled_wbc-bash-root \
-        --docker-repo /root/Projects/GR00T-WholeBodyControl \
-        --docker-bin "sudo docker"
+    python3 scripts/rosbag_gui.py \
+        --docker-container baglab \
+        --docker-repo /workspace \
+        --docker-bin "docker"
 """
 from __future__ import annotations
 
@@ -43,12 +45,14 @@ except ImportError as exc:
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
-# Bag data lives outside the repo; mounted at /workspace/data in docker.
-# Override with BAGLAB_BAGS_ROOT.
+# Single-mount layout: bags inside the repo, outputs inside the repo. Both
+# gitignored. BAGLAB_BAGS_ROOT overrides the bag root if you want it elsewhere.
 DATA_ROOT = Path(os.environ.get("BAGLAB_BAGS_ROOT", REPO_ROOT / "data"))
 BAGS_ROOT = DATA_ROOT / "orin_bags"
+OUTPUTS_ROOT = REPO_ROOT / "outputs"
 CONVERT_SCRIPT = SCRIPT_DIR / "convert_db3_to_mcap.py"
 RERUN_WEB_SCRIPT = SCRIPT_DIR / "bag_to_rerun_web.py"
+RERUN_SAVE_SCRIPT = SCRIPT_DIR / "bag_to_rerun.py"
 SYNC_SCRIPT = SCRIPT_DIR / "sync_orin_bags.sh"
 EXECUTION = {
     "docker_container": "",
@@ -152,11 +156,78 @@ class JobStore:
             jobs = sorted(self._jobs.values(), key=lambda job: job.started_at, reverse=True)
         return [job.snapshot() for job in jobs[:20]]
 
+    def find_running_with_prefix(self, prefix: str) -> list[Job]:
+        """Return every job whose name starts with `prefix` and is still running."""
+        with self._lock:
+            return [j for j in self._jobs.values()
+                    if j.status == "running" and j.name.startswith(prefix)]
+
+    def stop_running_with_prefix(self, prefix: str, timeout_s: float = 3.0) -> int:
+        """Stop matching running jobs and wait briefly for them to exit.
+        Returns the count of jobs we asked to stop. The brief wait lets any
+        ports they were holding (e.g. Rerun web/gRPC) be released before the
+        caller starts a replacement."""
+        stopped = self.find_running_with_prefix(prefix)
+        for job in stopped:
+            job.append("")
+            job.append("Auto-stopped by a new request that needs the same port.")
+            job.stop()
+        deadline = time.time() + timeout_s
+        while time.time() < deadline and any(j.status == "running" for j in stopped):
+            time.sleep(0.1)
+        return len(stopped)
+
+
+def _kill_leftover_serve_processes() -> list[int]:
+    """SIGTERM any leftover bag_to_rerun(_web).py processes anywhere in the
+    container, even ones this GUI didn't start (e.g. survivors of a previous
+    GUI restart). Returns the PIDs we signalled. Linux-only (uses /proc)."""
+    if not Path("/proc").is_dir():
+        return []
+    my_pid = os.getpid()
+    parent_pid = os.getppid()
+    killed: list[int] = []
+    for proc in Path("/proc").glob("[0-9]*"):
+        try:
+            pid = int(proc.name)
+        except ValueError:
+            continue
+        if pid in (my_pid, parent_pid):
+            continue
+        try:
+            cmdline = (proc / "cmdline").read_bytes()
+        except (FileNotFoundError, PermissionError):
+            continue
+        argv = cmdline.replace(b"\x00", b" ").decode("utf-8", "ignore")
+        if "bag_to_rerun" in argv:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed.append(pid)
+            except OSError:
+                pass
+    if killed:
+        # Give them a moment to release sockets.
+        deadline = time.time() + 3.0
+        while time.time() < deadline:
+            alive = []
+            for pid in killed:
+                try:
+                    os.kill(pid, 0)
+                    alive.append(pid)
+                except OSError:
+                    pass
+            if not alive:
+                break
+            time.sleep(0.1)
+    return killed
+
 
 JOBS = JobStore()
 
 
 def _safe_repo_path(value: str, *, must_exist: bool = False) -> Path:
+    if not value or not str(value).strip():
+        raise ValueError("Path is empty — pick a row in the bag list or paste a path.")
     path = Path(value).expanduser()
     if not path.is_absolute():
         path = REPO_ROOT / path
@@ -166,6 +237,27 @@ def _safe_repo_path(value: str, *, must_exist: bool = False) -> Path:
     if must_exist and not path.exists():
         raise ValueError(f"Path does not exist: {path}")
     return path
+
+
+def _resolve_bag(payload: dict) -> Path:
+    """Common bag validation for check / rerun / save actions.
+
+    Rejects an empty field, the bare repo root, anything that's not under the
+    bags root, and anything that isn't either an .mcap file or a rosbag2 dir
+    (a directory containing metadata.yaml). Returns the resolved path.
+    """
+    raw = str(payload.get("bag") or "")
+    bag = _safe_repo_path(raw, must_exist=True)
+    if bag == REPO_ROOT or bag == BAGS_ROOT:
+        raise ValueError("Pick a specific bag (.mcap file or rosbag2 dir), "
+                         "not the repo root or the bags root.")
+    if bag.is_file() and bag.suffix == ".mcap":
+        return bag
+    if bag.is_dir() and (bag / "metadata.yaml").exists():
+        return bag
+    raise ValueError(
+        f"Not a bag: {_rel(bag)} — expected an .mcap file or a rosbag2 "
+        f"directory containing metadata.yaml.")
 
 
 def _rel(path: Path) -> str:
@@ -213,6 +305,17 @@ def _bash_cmd(script: Path, *args: str) -> list[str]:
     if not EXECUTION["docker_container"]:
         return ["bash", str(script), *args]
     return _wrap_cmd(["bash", _container_path(script), *args])
+
+
+def _baglab_cmd(*args: str) -> list[str]:
+    """Invoke baglab — installed console script first, fall back to module form."""
+    base = ["baglab", *args]
+    if not EXECUTION["docker_container"]:
+        # Use the entry point if installed, else run as a module.
+        if subprocess.run(["which", "baglab"], capture_output=True).returncode == 0:
+            return base
+        return [sys.executable, "-m", "baglab", *args]
+    return _wrap_cmd(base)
 
 
 def _dir_size(path: Path) -> int:
@@ -284,6 +387,26 @@ def scan_mcaps() -> list[dict]:
     return mcaps
 
 
+def scan_rrds() -> list[dict]:
+    if not OUTPUTS_ROOT.exists():
+        return []
+    rrds = []
+    for path in sorted(OUTPUTS_ROOT.rglob("*.rrd"), reverse=True):
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        rrds.append(
+            {
+                "name": path.name,
+                "path": _rel(path),
+                "size": _fmt_bytes(stat.st_size),
+                "modified": datetime.fromtimestamp(stat.st_mtime).strftime("%Y-%m-%d %H:%M:%S"),
+                "open_cmd": f"rerun {path.resolve()}",
+            }
+        )
+    return rrds
+
+
 def build_convert_job(payload: dict) -> Job:
     bag = _safe_repo_path(str(payload.get("bag") or ""), must_exist=True)
     out = _safe_repo_path(str(payload.get("output") or ""))
@@ -315,9 +438,7 @@ def build_sync_job() -> Job:
 
 
 def build_rerun_job(payload: dict) -> Job:
-    bag = _safe_repo_path(str(payload.get("bag") or ""), must_exist=True)
-    if bag.suffix != ".mcap" and not bag.is_dir():
-        raise ValueError("Rerun input must be an .mcap file or bag directory.")
+    bag = _resolve_bag(payload)
     try:
         subsample = int(payload.get("subsample", 20))
     except (TypeError, ValueError) as exc:
@@ -341,7 +462,61 @@ def build_rerun_job(payload: dict) -> Job:
     )
     if payload.get("no_images"):
         cmd.append("--no-images")
+    # Only one Rerun-web serve at a time — it binds a fixed port pair.
+    JOBS.stop_running_with_prefix("Rerun web ")
+    # Also kill leftovers from a previous GUI session that this JobStore
+    # never tracked (the OS process can outlive a Python restart).
+    _kill_leftover_serve_processes()
     return JOBS.start(f"Rerun web {bag.name}", cmd)
+
+
+def build_rerun_save_job(payload: dict) -> Job:
+    """Run scripts/bag_to_rerun.py to write a .rrd file under outputs/."""
+    bag = _safe_repo_path(str(payload.get("bag") or ""), must_exist=True)
+    if bag.suffix != ".mcap" and not bag.is_dir():
+        raise ValueError("Input must be an .mcap file or bag directory.")
+    OUTPUTS_ROOT.mkdir(parents=True, exist_ok=True)
+    out_path = OUTPUTS_ROOT / f"{bag.stem}.rrd"
+    if not bool(payload.get("overwrite", False)) and out_path.exists():
+        raise ValueError(f"Output already exists: {_rel(out_path)}")
+    try:
+        subsample = int(payload.get("subsample", 20))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Subsample must be an integer.") from exc
+    if subsample <= 0:
+        raise ValueError("Subsample must be positive.")
+
+    cmd = _python_cmd(
+        RERUN_SAVE_SCRIPT,
+        bag,
+        "--subsample", str(subsample),
+        "--out", out_path,
+    )
+    if payload.get("no_images"):
+        cmd.append("--no-images")
+    if payload.get("no_robot"):
+        cmd.append("--no-robot")
+    if payload.get("show_collision"):
+        cmd.append("--show-collision")
+    if payload.get("strict"):
+        cmd.append("--strict")
+    return JOBS.start(f"Save .rrd {bag.name}", cmd)
+
+
+def build_check_job(payload: dict) -> Job:
+    """Run baglab check on a bag and surface the printed report."""
+    bag = _safe_repo_path(str(payload.get("bag") or ""), must_exist=True)
+    if bag.suffix != ".mcap" and not bag.is_dir():
+        raise ValueError("Input must be an .mcap file or bag directory.")
+    cmd = _baglab_cmd("check", str(bag) if EXECUTION["docker_container"]
+                      else str(bag.resolve()))
+    if payload.get("no_smoothness"):
+        cmd.append("--no-smoothness")
+    if payload.get("no_static"):
+        cmd.append("--no-static")
+    if payload.get("json"):
+        cmd.append("--json")
+    return JOBS.start(f"Check {bag.name}", cmd)
 
 
 INDEX_HTML = r"""
@@ -566,6 +741,19 @@ INDEX_HTML = r"""
           <div id="mcapRows" class="split-list"></div>
         </div>
       </section>
+
+      <section>
+        <div class="section-head">
+          <h2>RRD Recordings</h2>
+          <div id="rrdCount" class="status-line"></div>
+        </div>
+        <div class="panel-body">
+          <div id="rrdRows" class="split-list"></div>
+          <div class="muted" style="margin-top:8px;font-size:12px;">
+            Open on the host with the suggested <code>rerun ...</code> command.
+          </div>
+        </div>
+      </section>
     </div>
 
     <div class="stack">
@@ -588,6 +776,78 @@ INDEX_HTML = r"""
             Overwrite existing MCAP
           </label>
           <div id="convertStatus" class="status-line"></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>Quality Check</h2>
+          <button id="checkBtn" class="primary">Run check</button>
+        </div>
+        <div class="panel-body form-grid">
+          <label>
+            Bag (.mcap or .db3 dir)
+            <input id="checkInput" type="text" placeholder="data/orin_bags/...">
+          </label>
+          <div class="two">
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="checkNoSmoothness" type="checkbox">
+              Skip smoothness
+            </label>
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="checkNoStatic" type="checkbox">
+              Skip static-frame
+            </label>
+          </div>
+          <label class="check">
+            <input id="checkJson" type="checkbox">
+            JSON output (instead of summary)
+          </label>
+          <div id="checkStatus" class="status-line"></div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head">
+          <h2>Rerun (save .rrd)</h2>
+          <button id="saveBtn" class="primary">Save .rrd</button>
+        </div>
+        <div class="panel-body form-grid">
+          <label>
+            Bag (.mcap or .db3 dir)
+            <input id="saveInput" type="text" placeholder="data/orin_bags/...">
+          </label>
+          <div class="two">
+            <label>
+              Subsample
+              <input id="saveSubsample" type="number" min="1" value="20">
+            </label>
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="saveOverwrite" type="checkbox">
+              Overwrite
+            </label>
+          </div>
+          <div class="two">
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="saveNoImages" type="checkbox">
+              No images
+            </label>
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="saveNoRobot" type="checkbox">
+              No robot model
+            </label>
+          </div>
+          <div class="two">
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="saveShowCollision" type="checkbox">
+              Show collision
+            </label>
+            <label class="check" style="align-self:end; min-height:34px;">
+              <input id="saveStrict" type="checkbox">
+              Strict (missing-topic = fail)
+            </label>
+          </div>
+          <div id="saveStatus" class="status-line"></div>
         </div>
       </section>
 
@@ -617,8 +877,7 @@ INDEX_HTML = r"""
               No images
             </label>
           </div>
-          <div class="status-line">Open Rerun at http://127.0.0.1:<span id="rerunPortText">9876</span> after the job starts serving.</div>
-          <div id="rerunStatus" class="status-line"></div>
+          <div id="rerunStatus" class="status-line">Viewer URL will appear here once serving starts.</div>
         </div>
       </section>
 
@@ -641,8 +900,10 @@ INDEX_HTML = r"""
   <script>
     let bags = [];
     let mcaps = [];
+    let rrds = [];
     let selectedBag = null;
     let selectedMcap = null;
+    let selectedRrd = null;
     let activeJob = null;
     let pollTimer = null;
 
@@ -705,6 +966,9 @@ INDEX_HTML = r"""
       selectedBag = bag;
       $("bagInput").value = bag.path;
       $("mcapOutput").value = bag.default_mcap;
+      // Also seed the Check + Save panels so a single click is enough.
+      $("checkInput").value = bag.default_mcap_exists ? bag.default_mcap : bag.path;
+      $("saveInput").value = bag.default_mcap_exists ? bag.default_mcap : bag.path;
       if (!selectedMcap && bag.default_mcap_exists) {
         $("rerunInput").value = bag.default_mcap;
       }
@@ -714,7 +978,33 @@ INDEX_HTML = r"""
     function selectMcap(mcap) {
       selectedMcap = mcap;
       $("rerunInput").value = mcap.path;
+      $("checkInput").value = mcap.path;
+      $("saveInput").value = mcap.path;
       renderMcaps();
+    }
+
+    function renderRrds() {
+      $("rrdCount").textContent = `${rrds.length} files`;
+      const body = $("rrdRows");
+      body.innerHTML = "";
+      for (const rrd of rrds) {
+        const row = document.createElement("div");
+        row.className = "mcap-row" + (selectedRrd && selectedRrd.path === rrd.path ? " selected" : "");
+        row.innerHTML = `
+          <div>
+            <div title="${rrd.path}">${rrd.name}</div>
+            <div class="muted">${rrd.open_cmd}</div>
+          </div>
+          <div class="muted">${rrd.size}</div>
+        `;
+        row.onclick = () => {
+          selectedRrd = rrd;
+          // Copy the open-command to clipboard if the API is available.
+          if (navigator.clipboard) navigator.clipboard.writeText(rrd.open_cmd).catch(() => {});
+          renderRrds();
+        };
+        body.appendChild(row);
+      }
     }
 
     async function refresh() {
@@ -722,8 +1012,10 @@ INDEX_HTML = r"""
         const data = await api("/api/bags");
         bags = data.bags || [];
         mcaps = data.mcaps || [];
+        rrds = data.rrds || [];
         renderBags();
         renderMcaps();
+        renderRrds();
       } catch (err) {
         setStatus("convertStatus", err.message, true);
       }
@@ -807,16 +1099,61 @@ INDEX_HTML = r"""
           port: $("rerunPort").value,
           no_images: $("noImages").checked,
         });
+        // Poll the job log until we find the viewer URL, then show it.
+        const port = $("rerunPort").value || "9876";
+        setStatus("rerunStatus", "Starting… (URL will appear here)");
+        for (let i = 0; i < 120; i++) {       // up to 60 s
+          await new Promise(r => setTimeout(r, 500));
+          const data = await api(`/api/jobs/${activeJob}`);
+          const line = (data.job.logs || []).find(
+            l => l.includes("127.0.0.1") && l.includes("?url="));
+          if (line) {
+            const url = line.trim();
+            $("rerunStatus").innerHTML =
+              `Viewer ready — <a href="${url}" target="_blank" style="color:var(--accent)">open in browser</a><br><small style="color:var(--muted)">${url}</small>`;
+            break;
+          }
+          if (data.job.status !== "running") {
+            setStatus("rerunStatus", "Job finished (check job log for URL)");
+            break;
+          }
+        }
       } catch (err) {
         setStatus("rerunStatus", err.message, true);
+      }
+    };
+    $("checkBtn").onclick = async () => {
+      setStatus("checkStatus", "");
+      try {
+        await startJob("check", {
+          bag: $("checkInput").value,
+          no_smoothness: $("checkNoSmoothness").checked,
+          no_static: $("checkNoStatic").checked,
+          json: $("checkJson").checked,
+        });
+      } catch (err) {
+        setStatus("checkStatus", err.message, true);
+      }
+    };
+    $("saveBtn").onclick = async () => {
+      setStatus("saveStatus", "");
+      try {
+        await startJob("rerun_save", {
+          bag: $("saveInput").value,
+          subsample: $("saveSubsample").value,
+          overwrite: $("saveOverwrite").checked,
+          no_images: $("saveNoImages").checked,
+          no_robot: $("saveNoRobot").checked,
+          show_collision: $("saveShowCollision").checked,
+          strict: $("saveStrict").checked,
+        });
+      } catch (err) {
+        setStatus("saveStatus", err.message, true);
       }
     };
     $("jobSelect").onchange = () => {
       activeJob = $("jobSelect").value;
       startPolling();
-    };
-    $("rerunPort").oninput = () => {
-      $("rerunPortText").textContent = $("rerunPort").value || "9876";
     };
     $("stopBtn").onclick = async () => {
       if (!activeJob) return;
@@ -847,7 +1184,8 @@ def create_app() -> Flask:
 
     @app.get("/api/bags")
     def bags():
-        return jsonify({"bags": scan_bags(), "mcaps": scan_mcaps()})
+        return jsonify({"bags": scan_bags(), "mcaps": scan_mcaps(),
+                        "rrds": scan_rrds()})
 
     @app.get("/api/jobs")
     def jobs():
@@ -871,6 +1209,10 @@ def create_app() -> Flask:
                 job = build_sync_job()
             elif action == "rerun":
                 job = build_rerun_job(payload)
+            elif action == "rerun_save":
+                job = build_rerun_save_job(payload)
+            elif action == "check":
+                job = build_check_job(payload)
             else:
                 raise ValueError("Unknown job action.")
         except Exception as exc:
@@ -899,7 +1241,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--docker-repo",
-        default="/root/Projects/GR00T-WholeBodyControl",
+        default="/workspace",
         help="Repo path inside the Docker container.",
     )
     parser.add_argument(

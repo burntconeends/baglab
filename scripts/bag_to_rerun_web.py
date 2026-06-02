@@ -25,6 +25,7 @@ def main() -> int:
 
     cmd = [
         sys.executable,
+        "-u",  # unbuffered so the viewer URL prints immediately
         str(BAG_TO_RERUN),
         str(args.bag),
         "--subsample",

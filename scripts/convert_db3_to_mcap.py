@@ -24,7 +24,8 @@ from pathlib import Path
 from rosbags.highlevel import AnyReader
 from rosbags.rosbag2 import Writer, StoragePlugin
 
-from unitree_types import build_typestore
+from baglab.constants import DEFAULT_EXPECTED_TOPICS
+from baglab.typestore import build_typestore
 
 
 def convert(bag_path: Path, mcap_path: Path) -> None:
@@ -47,6 +48,13 @@ def convert(bag_path: Path, mcap_path: Path) -> None:
     try:
         with AnyReader([bag_path], default_typestore=typestore) as reader, \
              Writer(bag_wrapper, version=9, storage_plugin=StoragePlugin.MCAP) as writer:
+
+            # Surface missing expected topics upfront so a partial bag is obvious.
+            present = {c.topic for c in reader.connections}
+            missing = sorted(set(DEFAULT_EXPECTED_TOPICS) - present)
+            if missing:
+                print(f"WARNING: bag is missing {len(missing)} expected topics: "
+                      f"{', '.join(missing)}", file=sys.stderr)
 
             conn_map = {}
             for conn in reader.connections:

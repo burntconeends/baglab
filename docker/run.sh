@@ -1,23 +1,20 @@
 #!/bin/bash
 # Run the baglab container.
-# Mounts the baglab repo (read-only) and a bag data directory (read-write).
+#
+# Single mount: the entire baglab repo is bind-mounted at /workspace (rw).
+# Bags live at ~/baglab/data/ (populated by scripts/sync_orin_bags.sh) and
+# generated artifacts land in ~/baglab/outputs/. Both subdirs are gitignored.
 #
 # Usage:
 #   ./docker/run.sh                  # interactive bash
 #   ./docker/run.sh --build          # build image first
-#
-# Bag data directory (host) defaults to the GR00T-WholeBodyControl outputs,
-# override with BAGLAB_BAGS_ROOT:
-#   BAGLAB_BAGS_ROOT=/path/to/bags ./docker/run.sh
+#   BAGLAB_EXTRA_MOUNT=/path:/extra ./docker/run.sh  # optional extra bind mount
 
 set -e
 
 SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 IMAGE_NAME="baglab"
-
-# Host directory holding the bags (orin_bags/, *.mcap, etc.)
-BAGS_ROOT="${BAGLAB_BAGS_ROOT:-$HOME/GR00T/GR00T-WholeBodyControl/outputs}"
 
 if [[ "$1" == "--build" ]]; then
     echo "Building $IMAGE_NAME..."
@@ -29,13 +26,18 @@ if [[ "$1" == "--build" ]]; then
     shift
 fi
 
-mkdir -p "$BAGS_ROOT"
+mkdir -p "$REPO_DIR/data" "$REPO_DIR/outputs"
+
+EXTRA_MOUNT=()
+if [[ -n "$BAGLAB_EXTRA_MOUNT" ]]; then
+    EXTRA_MOUNT=(-v "$BAGLAB_EXTRA_MOUNT")
+fi
 
 exec docker run -it --rm \
     --network=host \
-    -u 0:0 \
-    -v "$REPO_DIR":/workspace:ro \
-    -v "$BAGS_ROOT":/workspace/data \
+    -u "$(id -u):$(id -g)" \
+    -v "$REPO_DIR":/workspace \
+    "${EXTRA_MOUNT[@]}" \
     -w /workspace \
     $IMAGE_NAME \
     "${@:-/bin/bash}"

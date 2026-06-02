@@ -1,5 +1,6 @@
-# Bag data — never committed
+# Bag data / mountpoints — never committed
 data/
+out/
 outputs/
 *.mcap
 *.db3
